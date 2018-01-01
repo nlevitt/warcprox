@@ -340,6 +340,7 @@ def warcprox_(request):
     os.chdir(work_dir)
 
     argv = ['warcprox',
+            '--max-threads=1',
             '--method-filter=GET',
             '--method-filter=POST',
             '--port=0',

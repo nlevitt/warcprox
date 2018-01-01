@@ -68,15 +68,18 @@ def parse_args():
     arg_parser.add_argument('--version', action='version',
         version="warcprox {}".format(warcprox.__version__))
     arg_parser.add_argument('-v', '--verbose', dest='verbose', action='store_true')
+    arg_parser.add_argument('--trace', dest='trace', action='store_true')
     arg_parser.add_argument('-q', '--quiet', dest='quiet', action='store_true')
 
     return arg_parser.parse_args(args=sys.argv[1:])
 
 def init_logging(verbose):
-    if args.verbose:
+    if args.trace:
+        loglevel = warcprox.TRACE
+    elif args.verbose:
         loglevel = logging.DEBUG
     elif args.quiet:
-        loglevel = logging.WARNING
+        loglevel = warcprox.NOTICE
     else:
         loglevel = logging.INFO
 

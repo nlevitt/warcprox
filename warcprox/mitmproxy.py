@@ -170,17 +170,30 @@ class ProxyingRecordingHTTPResponse(http_client.HTTPResponse):
             for header, value in extra_response_headers.items():
                 self.msg[header] = value
 
+        # if the response is missing content-length (and is not chunked),
+        # then we need to close the connection to the proxy client after this
+        # request, or the next request will hang
+        has_chunk_or_size = False
         for k,v in self.msg.items():
             if k.lower() not in (
                     'connection', 'proxy-connection', 'keep-alive',
                     'proxy-authenticate', 'proxy-authorization', 'upgrade',
                     'strict-transport-security'):
                 status_and_headers += '{}: {}\r\n'.format(k, v)
-        status_and_headers += 'Connection: close\r\n\r\n'
+                if k.lower() == 'content-length':
+                    has_chunk_or_size = True
+                elif k.lower() == 'transfer-encoding' and v.lower() == 'chunked':
+                    has_chunk_or_size = True
+        status_and_headers += '\r\n'
         self.proxy_client.sendall(status_and_headers.encode('latin1'))
 
         self.recorder.payload_starts_now()
         self.payload_digest = hashlib.new(self.digest_algorithm)
+
+        logging.trace(
+                'response has no content-length and is not chunked, need to '
+                'close proxy client connection after this request')
+        return has_chunk_or_size
 
     def read(self, amt=None):
         buf = http_client.HTTPResponse.read(self, amt)
@@ -207,6 +220,7 @@ class MitmProxyHandler(http_server.BaseHTTPRequestHandler):
     def __init__(self, request, client_address, server):
         threading.current_thread().name = 'MitmProxyHandler(tid={},started={},client={}:{})'.format(warcprox.gettid(), datetime.datetime.utcnow().isoformat(), client_address[0], client_address[1])
         self.is_connect = False
+        self.protocol_version = 'HTTP/1.1'  # enable keep-alive
         self._headers_buffer = []
         request.settimeout(60)  # XXX what value should this have?
         http_server.BaseHTTPRequestHandler.__init__(self, request, client_address, server)
@@ -231,6 +245,7 @@ class MitmProxyHandler(http_server.BaseHTTPRequestHandler):
         self.hostname = urlcanon.normalize_host(host).decode('ascii')
 
     def _connect_to_remote_server(self):
+        logging.trace('connecting to %s:%s', self.hostname, self.port)
         # Connect to destination
         if self.onion_tor_socks_proxy_host and self.hostname.endswith('.onion'):
             self.logger.info(
@@ -421,7 +436,9 @@ class MitmProxyHandler(http_server.BaseHTTPRequestHandler):
                     self._remote_server_sock, proxy_client=self.connection,
                     digest_algorithm=self.server.digest_algorithm,
                     url=self.url, method=self.command)
-            prox_rec_res.begin(extra_response_headers=extra_response_headers)
+            self.close_connection = (
+                    self.close_connection or not prox_rec_res.begin(
+                        extra_response_headers=extra_response_headers))
 
             buf = prox_rec_res.read(65536)
             while buf != b'':
@@ -488,6 +505,7 @@ class PooledMixIn(socketserver.ThreadingMixIn):
         return result
 
     def process_request(self, request, client_address):
+        logging.trace('client_address=%r', client_address)
         self.active_requests.add(request)
         future = self.pool.submit(
                 self.process_request_thread, request, client_address)
@@ -520,8 +538,9 @@ class PooledMixIn(socketserver.ThreadingMixIn):
             time.sleep(0.05)
         res = self.socket.accept()
         self.logger.trace(
-                'accepted after %.1f sec active_requests=%s socket=%s',
-                time.time() - start, len(self.active_requests), res[0])
+                'accepted after %.1f sec active_requests=%s client_address=%s',
+                time.time() - start, len(self.active_requests),
+                res[0].getpeername())
         self.unaccepted_requests -= 1
         return res
 
@@ -535,6 +554,7 @@ class MitmProxy(http_server.HTTPServer):
         self.process_request or PooledMitmProxy.process_request_thread) needs
         to get a hold of that socket so it can close it.
         '''
+        logging.trace('client_address=%r', client_address)
         req_handler = self.RequestHandlerClass(request, client_address, self)
         return req_handler.request
 
@@ -547,6 +567,7 @@ class MitmProxy(http_server.HTTPServer):
         to self.shutdown_request. See the comment on self.finish_request for
         the rationale.
         '''
+        logging.trace('client_address=%r', client_address)
         request = self.finish_request(request, client_address)
         self.shutdown_request(request)
 
@@ -588,6 +609,7 @@ class PooledMitmProxy(PooledMixIn, MitmProxy):
         to self.shutdown_request. See the comment on MitmProxy.finish_request
         for the rationale.
         '''
+        logging.trace('client_address=%r', client_address)
         try:
             request = self.finish_request(request, client_address)
             self.shutdown_request(request)

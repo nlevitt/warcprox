@@ -414,6 +414,12 @@ class SingleThreadedWarcProxy(http_server.HTTPServer, object):
 
         self.running_stats = warcprox.stats.RunningStats()
 
+    def server_activate(self):
+        http_server.HTTPServer.server_activate(self)
+        self.logger.info(
+                'listening on %s:%s', self.server_address[0],
+                self.server_address[1])
+
     def status(self):
         if hasattr(super(), 'status'):
             result = super().status()
@@ -460,12 +466,6 @@ class WarcProxy(SingleThreadedWarcProxy, warcprox.mitmproxy.PooledMitmProxy):
                 self, options.max_threads, options)
         SingleThreadedWarcProxy.__init__(
                 self, ca, recorded_url_q, stats_db, options)
-
-    def server_activate(self):
-        http_server.HTTPServer.server_activate(self)
-        self.logger.info(
-                'listening on %s:%s', self.server_address[0],
-                self.server_address[1])
 
     def server_close(self):
         self.logger.info('shutting down')

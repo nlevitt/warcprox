@@ -190,9 +190,10 @@ class ProxyingRecordingHTTPResponse(http_client.HTTPResponse):
         self.recorder.payload_starts_now()
         self.payload_digest = hashlib.new(self.digest_algorithm)
 
-        logging.trace(
-                'response has no content-length and is not chunked, need to '
-                'close proxy client connection after this request')
+        if not has_chunk_or_size:
+            logging.trace(
+                    'response has no content-length and is not chunked, need '
+                    'to close proxy client connection after this request')
         return has_chunk_or_size
 
     def read(self, amt=None):
@@ -224,6 +225,15 @@ class MitmProxyHandler(http_server.BaseHTTPRequestHandler):
         self._headers_buffer = []
         request.settimeout(60)  # XXX what value should this have?
         http_server.BaseHTTPRequestHandler.__init__(self, request, client_address, server)
+
+    def handle(self):
+        """Handle multiple requests if necessary."""
+        self.close_connection = True
+
+        self.handle_one_request()
+        while not self.close_connection:
+            logging.trace('keeping connection alive to handle another request')
+            self.handle_one_request()
 
     def _determine_host_port(self):
         # Get hostname and port to connect to

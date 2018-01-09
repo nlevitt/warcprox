@@ -33,6 +33,7 @@ import warcio.archiveiterator
 import pytest
 import re
 import rethinkdb as r
+import random
 
 @contextlib.contextmanager
 def warcprox_controller(*argv):
@@ -97,24 +98,35 @@ def rethinkdb_db():
         logging.info('rethinkdb not running on localhost:28015')
         yield None
 
-@pytest.fixture(scope='function')
-def available_dedup_options():
-    dedup_options = ['--dedup-db-file=%s' % randstr()]
-    if rethinkdb_db:
-        dedup_options.append(
-                '--rethinkdb-dedup-url=rethinkdb://localhost/%s/dedup_%s' % (
-                    rethinkdb_db, randstr()))
-        dedup_options.append(
-                '--rethinkdb-big-table-url=rethinkdb://localhost/%s/big_table_%s' % (
-                    rethinkdb_db, randstr()))
-    return dedup_options
+DEDUP_CHOICES = ['sqlite', 'rethinkdb_dedup', 'rethinkdb_big_table', 'trough']
+def dedup_option(rethinkdb_db, dedup_choice):
+    if dedup_choice == 'sqlite':
+        return '--dedup-db-file=%s' % randstr()
+    elif dedup_choice == 'rethinkdb_dedup':
+        if rethinkdb_db:
+            return '--rethinkdb-dedup-url=rethinkdb://localhost/%s/dedup_%s' % (rethinkdb_db, randstr())
+        else:
+            return None
+    elif dedup_choice == 'rethinkdb_big_table':
+        if rethinkdb_db:
+            return '--rethinkdb-big-table-url=rethinkdb://localhost/%s/big_table_%s' % (rethinkdb_db, randstr())
+        else:
+            return None
+    elif dedup_choice == 'trough':
+        return None
+    else:
+        raise Exception('no such dedup choice %s' % dedup_choice)
 
-@pytest.mark.parametrize('dedup_option', available_dedup_options)
-def test_archive_url(httpd_base_url, dedup_option):
+@pytest.mark.parametrize('dedup_choice', DEDUP_CHOICES)
+def test_archive_url(rethinkdb_db, httpd_base_url, dedup_choice):
+    dedup_arg = dedup_option(rethinkdb_db, dedup_choice)
+    if not dedup_arg:
+        pytest.skip('services not running for dedup choice %s' % dedup_choice)
+
     url = '%s/a/b' % httpd_base_url
 
     with warcprox_controller(
-            '--port=0', '--plugin=%s.%s' % (
+            dedup_arg, '--port=0', '--plugin=%s.%s' % (
                 __name__, NotifyMe.__name__)) as warcprox_:
         listener = warcprox_.warc_writer_threads[0].listeners[-1]
         assert listener.the_list == []
@@ -148,12 +160,16 @@ def test_archive_url(httpd_base_url, dedup_option):
             with pytest.raises(StopIteration):
                 next(rec_iter)
 
+@pytest.mark.parametrize('dedup_choice', DEDUP_CHOICES)
+def test_dedup(rethinkdb_db, httpd_base_url, dedup_choice):
+    dedup_arg = dedup_option(rethinkdb_db, dedup_choice)
+    if not dedup_arg:
+        pytest.skip('services not running for dedup choice %s' % dedup_choice)
 
-def test_dedup(httpd_base_url):
     url = '%s/e/f' % httpd_base_url
 
     with warcprox_controller(
-            '--port=0', '--plugin=%s.%s' % (
+            dedup_arg, '--port=0', '--plugin=%s.%s' % (
                 __name__, NotifyMe.__name__)) as warcprox_:
         listener = warcprox_.warc_writer_threads[0].listeners[-1]
         assert listener.the_list == []

@@ -36,16 +36,17 @@ import rethinkdb as r
 import random
 
 @contextlib.contextmanager
-def warcprox_controller(*argv):
+def warcprox_controller(*opts):
     orig_dir = os.getcwd()
     with tempfile.TemporaryDirectory() as work_dir:
         logging.info('changing to working directory %r', work_dir)
         os.chdir(work_dir)
 
+        argv = ('warcprox',) + opts
         args = warcprox.main.parse_args(argv)
         warcprox_ = warcprox.main.init_controller(args)
 
-        logging.info('starting warcprox with args %s', argv)
+        logging.info('starting warcprox with args %s', opts)
         warcprox_thread = threading.Thread(
                 name='WarcproxThread', target=warcprox_.run_until_shutdown)
         warcprox_thread.start()
@@ -67,11 +68,30 @@ def proxies(warcprox_):
     proxy_url = 'http://localhost:%s' % warcprox_.proxy.server_port
     return {'http': proxy_url, 'https': proxy_url}
 
-class NotifyMe:
+class UrlCompleteWaitrix:
+    '''
+    Keeps list of completed urls. Should be last listener configured for
+    warcprox. Only useful for testing. To know that a url is complete, checks
+    for batch emptiness on listeners that do batching (RethinkStatsDb,
+    RethinkCaptures).
+    '''
     def __init__(self):
-        self.the_list = []
+        self.pending_batches = []
+        self.complete_urls = []
+    def setup(self, warcprox_):
+        for listener in warcprox_.warc_writer_threads[0].listeners:
+            if isinstance(listener, warcprox.bigtable.RethinkCapturesDedup):
+                self.pending_batches.append(listener.captures_db._batch)
+            elif isinstance(listener, warcprox.stats.RethinkStatsDb):
+                self.pending_batches.append(listener._batch)
+        logging.info('pending_batches=%r', self.pending_batches)
     def notify(self, recorded_url, records):
-        self.the_list.append((recorded_url, records))
+        logging.trace(
+                'pending batch sizes: %s',
+                [len(batch) for batch in self.pending_batches])
+        if self.pending_batches:
+            wait(lambda: all(len(batch) == 0 for batch in self.pending_batches), 10)
+        self.complete_urls.append((recorded_url, records))
 
 # see https://github.com/pytest-dev/pytest/issues/349#issuecomment-189370273
 @pytest.fixture(params=['http_daemon', 'https_daemon'])
@@ -98,8 +118,29 @@ def rethinkdb_db():
         logging.info('rethinkdb not running on localhost:28015')
         yield None
 
+@pytest.fixture(scope='function')
+def trough_db_url():
+    # XXX runs too many times
+    rethink_url = 'rethinkdb://localhost/trough_configuration'
+    try:
+        tables = r.db('trough_configuration').table_list().run(r.connect())
+        if all(table in tables for table in [
+            'assignment', 'lock', 'schema', 'services']):
+            logging.trace('trough db found at %s', rethink_url)
+            warcprox.trough.TroughClient(rethink_url).schema_exists('default')
+            yield '--rethinkdb-trough-db-url=%s' % rethink_url
+            # clean up
+            warcprox.trough.TroughClient(rethink_url).write(
+                    '__unspecified__', 'delete from dedup')
+        else:
+            logging.trace('trough db not found at %s', rethink_url)
+            yield None
+    except Exception as e:
+        logging.info('no trough: %r', e)
+        yield None
+
 DEDUP_CHOICES = ['sqlite', 'rethinkdb_dedup', 'rethinkdb_big_table', 'trough']
-def dedup_option(rethinkdb_db, dedup_choice):
+def dedup_option(rethinkdb_db, trough_db_url, dedup_choice):
     if dedup_choice == 'sqlite':
         return '--dedup-db-file=%s' % randstr()
     elif dedup_choice == 'rethinkdb_dedup':
@@ -113,13 +154,13 @@ def dedup_option(rethinkdb_db, dedup_choice):
         else:
             return None
     elif dedup_choice == 'trough':
-        return None
+        return trough_db_url
     else:
         raise Exception('no such dedup choice %s' % dedup_choice)
 
 @pytest.mark.parametrize('dedup_choice', DEDUP_CHOICES)
-def test_archive_url(rethinkdb_db, httpd_base_url, dedup_choice):
-    dedup_arg = dedup_option(rethinkdb_db, dedup_choice)
+def test_archive_url(rethinkdb_db, trough_db_url, httpd_base_url, dedup_choice):
+    dedup_arg = dedup_option(rethinkdb_db, trough_db_url, dedup_choice)
     if not dedup_arg:
         pytest.skip('services not running for dedup choice %s' % dedup_choice)
 
@@ -127,9 +168,10 @@ def test_archive_url(rethinkdb_db, httpd_base_url, dedup_choice):
 
     with warcprox_controller(
             dedup_arg, '--port=0', '--plugin=%s.%s' % (
-                __name__, NotifyMe.__name__)) as warcprox_:
-        listener = warcprox_.warc_writer_threads[0].listeners[-1]
-        assert listener.the_list == []
+                __name__, UrlCompleteWaitrix.__name__)) as warcprox_:
+        waitrix = warcprox_.warc_writer_threads[0].listeners[-1]
+        waitrix.setup(warcprox_)
+        assert waitrix.complete_urls == []
 
         # fetch/archive
         response = requests.get(url, proxies=proxies(warcprox_), verify=False)
@@ -137,10 +179,10 @@ def test_archive_url(rethinkdb_db, httpd_base_url, dedup_choice):
         assert response.headers['warcprox-test-header'] == 'a!'
         assert response.content == b'I am the warcprox test payload! bbbbbbbbbb!\n'
 
-        # our listener tells us when it's done writing
-        wait(lambda: len(listener.the_list) > 0, 10.0)
-        assert len(listener.the_list) == 1
-        (recorded_url, (principal_record, request_record)) = listener.the_list[0]
+        # our waitrix tells us when it's done writing
+        wait(lambda: len(waitrix.complete_urls) > 0, 10.0)
+        assert len(waitrix.complete_urls) == 1
+        (recorded_url, (principal_record, request_record)) = waitrix.complete_urls[0]
         assert recorded_url.url == url.encode('ascii')
         assert principal_record.warc_filename
 
@@ -161,8 +203,8 @@ def test_archive_url(rethinkdb_db, httpd_base_url, dedup_choice):
                 next(rec_iter)
 
 @pytest.mark.parametrize('dedup_choice', DEDUP_CHOICES)
-def test_dedup(rethinkdb_db, httpd_base_url, dedup_choice):
-    dedup_arg = dedup_option(rethinkdb_db, dedup_choice)
+def test_dedup(rethinkdb_db, trough_db_url, httpd_base_url, dedup_choice):
+    dedup_arg = dedup_option(rethinkdb_db, trough_db_url, dedup_choice)
     if not dedup_arg:
         pytest.skip('services not running for dedup choice %s' % dedup_choice)
 
@@ -170,9 +212,10 @@ def test_dedup(rethinkdb_db, httpd_base_url, dedup_choice):
 
     with warcprox_controller(
             dedup_arg, '--port=0', '--plugin=%s.%s' % (
-                __name__, NotifyMe.__name__)) as warcprox_:
-        listener = warcprox_.warc_writer_threads[0].listeners[-1]
-        assert listener.the_list == []
+                __name__, UrlCompleteWaitrix.__name__)) as warcprox_:
+        waitrix = warcprox_.warc_writer_threads[0].listeners[-1]
+        waitrix.setup(warcprox_)
+        assert waitrix.complete_urls == []
 
         # check not in dedup db
         dedup_lookup = warcprox_.warc_writer_threads[0].dedup_db.lookup(
@@ -186,11 +229,11 @@ def test_dedup(rethinkdb_db, httpd_base_url, dedup_choice):
         assert response.content == b'I am the warcprox test payload! ffffffffff!\n'
 
         # wait for it to finish writing
-        wait(lambda: len(listener.the_list) > 0, 10.0)
-        len(listener.the_list) == 1
+        wait(lambda: len(waitrix.complete_urls) > 0, 10.0)
+        len(waitrix.complete_urls) == 1
 
         # check that a response record was written
-        (recorded_url, (principal_record, request_record)) = listener.the_list[0]
+        (recorded_url, (principal_record, request_record)) = waitrix.complete_urls[0]
         assert recorded_url.url == url.encode('ascii')
         assert principal_record.warc_filename
         assert principal_record.type == b'response'
@@ -214,11 +257,11 @@ def test_dedup(rethinkdb_db, httpd_base_url, dedup_choice):
         assert response.content == b'I am the warcprox test payload! ffffffffff!\n'
 
         # wait for it to finish writing
-        wait(lambda: len(listener.the_list) > 1, 10.0)
-        len(listener.the_list) == 2
+        wait(lambda: len(waitrix.complete_urls) > 1, 10.0)
+        len(waitrix.complete_urls) == 2
 
         # check that a response record was written
-        (recorded_url, (principal_record, request_record)) = listener.the_list[-1]
+        (recorded_url, (principal_record, request_record)) = waitrix.complete_urls[-1]
         assert recorded_url.url == url.encode('ascii')
         assert principal_record.warc_filename
         assert principal_record.type == b'revisit'

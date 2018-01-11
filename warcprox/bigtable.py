@@ -79,7 +79,7 @@ class RethinkCaptures:
                         self.logger.debug(
                                 "inserted %s entries to big captures table",
                                 len(self._batch))
-                    self._batch = []
+                    self._batch.clear()
         except BaseException as e:
             self.logger.error(
                     "caught exception trying to save %s entries, they will "

@@ -239,7 +239,7 @@ class RethinkStatsDb(StatsDb):
     def _update_batch(self):
         with self._batch_lock:
             batch_copy = copy.deepcopy(self._batch)
-            self._batch = {}
+            self._batch.clear()
         try:
             if len(batch_copy) > 0:
                 # XXX can all the buckets be done in one query?
